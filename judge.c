@@ -6,6 +6,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,7 @@
 #include <termios.h>
 #include <seccomp.h>
 #include <poll.h>
+#include <time.h>
 
 // 시스템 설정 및 타임아웃 매크로
 #define MAX_BUFFER          4096
@@ -177,7 +179,13 @@ pid_t execute_process(const char *cmd, int fd_in, int fd_out, int is_sandboxed) 
  */
 void* watchdog_thread(void* arg) {
     pid_t target = *(pid_t*)arg; // 감시 대상 자식 프로세스의 PID
-    usleep(TIME_LIMIT_MS * 1000); // 밀리초를 마이크로초로 변환하여 대기
+
+    // 밀리초를 마이크로초로 변환하여 대기
+    struct timespec req = {
+        .tv_sec = TIME_LIMIT_MS / 1000,
+        .tv_nsec = (TIME_LIMIT_MS % 1000) * 1000000L,
+    };
+    nanosleep(&req, NULL);
     if (target > 0) kill(target, SIGKILL);
     return NULL;
 }
@@ -202,20 +210,20 @@ void read_pipes_async(int fd1, char *buf1, size_t size1, int fd2, char *buf2, si
 
         // 정답 코드 파이프 읽기
         if (pfds[0].revents & (POLLIN | POLLHUP)) {
-            char temp[4096];
-            ssize_t n = read(pfds[0].fd, temp, sizeof(temp));
+            char temp[MAX_BUFFER + 1];
+            ssize_t n = read(pfds[0].fd, temp, MAX_BUFFER); //MAX_BUFFER만큼 들어가지 않을 경우 쓰레기값 들어가는지 확인여부 + \0 끝에 추가여부
             if (n > 0) {
-                if (len1 + n <= size1 - 15) { memcpy(buf1 + len1, temp, n); len1 += n; }
+                if (len1 + n <= size1 - 15) { memcpy(buf1 + len1, temp, n); len1 += n; temp[n] = '\0'; }
                 else trunc1 = 1; // 버퍼 초과 시 잘림 처리
             } else { pfds[0].fd = -1; active--; }
         }
 
         // 제출 코드 파이프 읽기
         if (pfds[1].revents & (POLLIN | POLLHUP)) {
-            char temp[4096];
-            ssize_t n = read(pfds[1].fd, temp, sizeof(temp));
+            char temp[MAX_BUFFER + 1];
+            ssize_t n = read(pfds[1].fd, temp, MAX_BUFFER);
             if (n > 0) {
-                if (len2 + n <= size2 - 15) { memcpy(buf2 + len2, temp, n); len2 += n; }
+                if (len2 + n <= size2 - 15) { memcpy(buf2 + len2, temp, n); len2 += n; temp[n] = '\0'; }
                 else trunc2 = 1; // 버퍼 초과 시 잘림 처리
             } else { pfds[1].fd = -1; active--; }
         }
@@ -510,7 +518,7 @@ void run_judge_session(const char *prob_num, int max_test_cases, const char *gen
         if (fail_list_head == NULL) {
             printf(MSG_ALL_PASS, test_count);
             printf(MSG_JUDGE_END);
-            while(getchar() != '\n');
+            while(getchar() != 'Q' || getchar() != 'q' || getchar() != '\n');
         } else {
             export_fails_to_file(fail_list_head, prob_num); 
             view_fails_interactive(fail_list_head);         
@@ -577,9 +585,15 @@ int main() {
             printf(MSG_COMPILE_ING);
             if (system(compile_cmd) == 0) snprintf(sub_cmd, sizeof(sub_cmd), "./%s", BIN_TEMP_NAME);
             else { printf(MSG_COMPILE_ERR); compile_success = 0; }
-        } else { 
+        } else if(lang_choice == 2)
+        {  // 0 || 1 아닐 경우 전부 파이썬 처리되는 것 방지
             printf("- 언어: Python\n");
             snprintf(sub_cmd, sizeof(sub_cmd), CMD_FMT_PYTHON, file_path);
+        }
+        else
+        {
+            printf("잘못된 번호입니다. 다시 시작해 주세요.\n");
+            continue;
         }
 
         if (compile_success) {
@@ -591,7 +605,7 @@ int main() {
             sleep(1);
 
             run_judge_session(prob_num, max_test_cases, gen_cmd, sol_cmd, sub_cmd);
-            
+
             // 임시 생성된 바이너리 파일 정리
             if (lang_choice == 0 || lang_choice == 1) remove(BIN_TEMP_NAME);
         }
