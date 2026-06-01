@@ -5,7 +5,6 @@
  * 입력 생성기와 정답 코드는 컴파일된 실행 파일, 고정 입력값은 텍스트 파일 형식이어야 함
  */
 
-#define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
 #include <stdio.h>
@@ -21,6 +20,8 @@
 #include <seccomp.h>
 #include <poll.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
 
 // 시스템 설정 및 타임아웃 매크로
 #define MAX_BUFFER          4096
@@ -112,7 +113,10 @@ void setup_signals() {
     sa.sa_handler = sigint_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
-    if (sigaction(SIGINT, &sa, NULL) == -1) die("sigaction error");
+    if (sigaction(SIGINT, &sa, NULL) == -1)
+        die("sigaction error");
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+        die("signal SIGPIPE error");
 }
 
 /*
@@ -121,7 +125,8 @@ void setup_signals() {
  */
 void setup_seccomp() {
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
-    if (ctx == NULL) die("seccomp_init failed");
+    if (ctx == NULL)
+        die("seccomp_init failed");
 
     // 네트워크 및 소켓 관련 시스템 콜 통제
     seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 0);
@@ -130,7 +135,8 @@ void setup_seccomp() {
     seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(listen), 0);
     seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(ptrace), 0);
 
-    if (seccomp_load(ctx) < 0) die("seccomp_load failed");
+    if (seccomp_load(ctx) < 0)
+        die("seccomp_load failed");
     seccomp_release(ctx);
 }
 
@@ -140,11 +146,12 @@ void setup_seccomp() {
  */
 pid_t execute_process(const char *cmd, int fd_in, int fd_out, int is_sandboxed) {
     pid_t pid = fork();
-    if (pid < 0) die("fork failed");
+    if (pid < 0)
+        die("fork failed");
     
     if (pid == 0) {
         if (is_sandboxed) {
-            struct rlimit p_limit = {0, 0}; // 프로세스 생성 한도 (포크 밤 방지)
+            struct rlimit p_limit = {10, 10}; // 프로세스 생성 한도
             if (setrlimit(RLIMIT_NPROC, &p_limit) == -1) die("RLIMIT_NPROC fail");
 
             struct rlimit f_limit = {1024 * 1024, 1024 * 1024}; // 파일 생성 크기 한도 (디스크 소모 방지)
@@ -153,7 +160,7 @@ pid_t execute_process(const char *cmd, int fd_in, int fd_out, int is_sandboxed) 
             struct rlimit c_limit = { (TIME_LIMIT_MS / 1000) + 1, (TIME_LIMIT_MS / 1000) + 1 }; // CPU 사용 시간 한도
             if (setrlimit(RLIMIT_CPU, &c_limit) == -1) die("RLIMIT_CPU fail");
             
-            struct rlimit m_limit = {MEM_LIMIT_KB * 1024, MEM_LIMIT_KB * 1024}; // 메모리 할당 한도
+            struct rlimit m_limit = {1024 * 1024 * 1024, 1024 * 1024 * 1024}; // 메모리 할당 한도 1GB
             if (setrlimit(RLIMIT_AS, &m_limit) == -1) die("RLIMIT_AS fail");
 
             setup_seccomp();
@@ -161,12 +168,13 @@ pid_t execute_process(const char *cmd, int fd_in, int fd_out, int is_sandboxed) 
 
         // 파이프 파일 디스크립터를 표준 입출력으로 리다이렉션
         if (fd_in != STDIN_FILENO) {
-            dup2(fd_in, STDIN_FILENO); close(fd_in);
+            dup2(fd_in, STDIN_FILENO);
+            close(fd_in);
         }
         if (fd_out != STDOUT_FILENO) {
-            dup2(fd_out, STDOUT_FILENO); close(fd_out);
+            dup2(fd_out, STDOUT_FILENO);
+            close(fd_out);
         }
-        
         execlp("sh", "sh", "-c", cmd, NULL);
         die("execlp failed");
     }
@@ -179,14 +187,18 @@ pid_t execute_process(const char *cmd, int fd_in, int fd_out, int is_sandboxed) 
  */
 void* watchdog_thread(void* arg) {
     pid_t target = *(pid_t*)arg; // 감시 대상 자식 프로세스의 PID
+    if (target <= 0)
+        return NULL;
 
-    // 밀리초를 마이크로초로 변환하여 대기
     struct timespec req = {
         .tv_sec = TIME_LIMIT_MS / 1000,
         .tv_nsec = (TIME_LIMIT_MS % 1000) * 1000000L,
     };
-    nanosleep(&req, NULL);
-    if (target > 0) kill(target, SIGKILL);
+
+    nanosleep(&req, NULL);  // 밀리초를 마이크로초로 변환하여 대기
+    if (target > 0)
+        kill(target, SIGKILL);
+
     return NULL;
 }
 
@@ -196,39 +208,60 @@ void* watchdog_thread(void* arg) {
  */
 void read_pipes_async(int fd1, char *buf1, size_t size1, int fd2, char *buf2, size_t size2) {
     struct pollfd pfds[2]; // 다중 I/O 감시를 위한 구조체 배열
-    pfds[0].fd = fd1; pfds[0].events = POLLIN;
-    pfds[1].fd = fd2; pfds[1].events = POLLIN;
+    pfds[0].fd = fd1;
+    pfds[0].events = POLLIN;
+    pfds[1].fd = fd2;
+    pfds[1].events = POLLIN;
 
     size_t len1 = 0, len2 = 0; // 각 버퍼에 쓰인 현재 데이터 길이
     int trunc1 = 0, trunc2 = 0; // 잘림 발생 여부 플래그
     int active = 2; // 데이터를 읽기 위해 대기 중인 활성 파이프 개수
     
-    memset(buf1, 0, size1); memset(buf2, 0, size2);
+    memset(buf1, 0, size1);
+    memset(buf2, 0, size2);
 
     while (active > 0) {
         if (poll(pfds, 2, POLL_TIMEOUT) <= 0) break;
 
-        // 정답 코드 파이프 읽기
+        // 1. 정답 코드 파이프 읽기
         if (pfds[0].revents & (POLLIN | POLLHUP)) {
             char temp[MAX_BUFFER + 1];
-            ssize_t n = read(pfds[0].fd, temp, MAX_BUFFER); //MAX_BUFFER만큼 들어가지 않을 경우 쓰레기값 들어가는지 확인여부 + \0 끝에 추가여부
+            ssize_t n = read(pfds[0].fd, temp, MAX_BUFFER);
             if (n > 0) {
-                if (len1 + n <= size1 - 15) { memcpy(buf1 + len1, temp, n); len1 += n; temp[n] = '\0'; }
-                else trunc1 = 1; // 버퍼 초과 시 잘림 처리
-            } else { pfds[0].fd = -1; active--; }
+                if (len1 + (size_t)n <= size1 - 15) {
+                    memcpy(buf1 + len1, temp, n);
+                    len1 += n; temp[n] = '\0';
+                }
+                else {
+                    trunc1 = 1;
+                }
+            } else if (n < 0 && errno == EINTR) {
+                // 시그널에 의해 방해받은 경우: 파이프를 닫지 않고 무시 (다시 poll을 돌게 됨)
+            } else { // 진짜로 끝났거나 치명적 에러인 경우에만 닫음
+                pfds[0].fd = -1;
+                active--; 
+            }
         }
 
-        // 제출 코드 파이프 읽기
+        // 2. 제출 코드 파이프 읽기
         if (pfds[1].revents & (POLLIN | POLLHUP)) {
             char temp[MAX_BUFFER + 1];
             ssize_t n = read(pfds[1].fd, temp, MAX_BUFFER);
             if (n > 0) {
-                if (len2 + n <= size2 - 15) { memcpy(buf2 + len2, temp, n); len2 += n; temp[n] = '\0'; }
-                else trunc2 = 1; // 버퍼 초과 시 잘림 처리
-            } else { pfds[1].fd = -1; active--; }
+                if (len2 + (size_t)n <= size2 - 15) { 
+                    memcpy(buf2 + len2, temp, n);
+                    len2 += n; temp[n] = '\0';
+                }
+                else {
+                    trunc2 = 1;
+                }
+            } else if (n < 0 && errno == EINTR) {}
+            else {
+                pfds[1].fd = -1;
+                active--; 
+            }
         }
     }
-    
     // 잘린 버퍼 끝에 생략 기호 추가
     if (trunc1) strcat(buf1, "...truncated");
     if (trunc2) strcat(buf2, "...truncated");
@@ -239,12 +272,22 @@ void read_pipes_async(int fd1, char *buf1, size_t size1, int fd2, char *buf2, si
  * 양방향 탐색을 지원하기 위해 새 노드의 prev 포인터에 이전 노드를 연결함
  */
 void add_fail_case(FailNode **head, int test_num, ErrorType err_type, const char *in, const char *exp, const char *act) {
-    FailNode *new_node = (FailNode *)malloc(sizeof(FailNode)); // 힙 영역에 할당할 새 실패 노드
+    FailNode *new_node = (FailNode *) malloc (sizeof(FailNode)); // 힙 영역에 할당할 새 실패 노드
+    if (new_node == NULL) {
+        die("malloc failed: out of memory");
+    }
+
     new_node->test_number = test_num;
     new_node->error_type = err_type;
+    
     strncpy(new_node->input, in, MAX_BUFFER - 1);
+    new_node->input[MAX_BUFFER - 1] = '\0'; //문자열 끝 널문자 포함
+
     strncpy(new_node->expected, exp, MAX_BUFFER - 1);
+    new_node->expected[MAX_BUFFER - 1] = '\0';
+
     strncpy(new_node->actual, act, MAX_BUFFER - 1);
+    new_node->actual[MAX_BUFFER - 1] = '\0';
     new_node->prev = NULL;
     new_node->next = NULL;
 
@@ -252,7 +295,8 @@ void add_fail_case(FailNode **head, int test_num, ErrorType err_type, const char
         *head = new_node;
     } else {
         FailNode *curr = *head;
-        while (curr->next != NULL) curr = curr->next;
+        while (curr->next != NULL)
+            curr = curr->next;
         curr->next = new_node;
         new_node->prev = curr; 
     }
@@ -278,9 +322,10 @@ void free_fail_list(FailNode **head) {
  * 에러 타입과 입출력 결과를 포맷팅하여 뷰어 종료 후에도 오답 원인을 분석할 수 있도록 파일에 기록함
  */
 void export_fails_to_file(FailNode *head, const char *prob_num) {
-    if (head == NULL) return;
+    if (head == NULL)
+        return;
 
-    char filename[256]; // 생성할 로그 파일의 이름 버퍼
+    char filename[256] = {0}; // 생성할 로그 파일의 이름 버퍼
     snprintf(filename, sizeof(filename), "log_%s.txt", prob_num);
 
     FILE *fp = fopen(filename, "w");
@@ -327,10 +372,16 @@ void disable_raw_mode() {
  * 비정상 종료 시 터미널 먹통을 방지하기 위해 atexit 방어 코드를 등록함
  */
 void enable_raw_mode() {
+    static int atexit_registered = 0; // 정적 변수로 등록 여부 추적
     tcgetattr(STDIN_FILENO, &orig_termios);
-    atexit(disable_raw_mode); 
+
+    if (!atexit_registered) {
+        atexit(disable_raw_mode); 
+        atexit_registered = 1;
+    }
+
     struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON); // 에코 및 엔터 대기 해제
+    raw.c_lflag &= ~(ECHO | ICANON);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
@@ -339,7 +390,8 @@ void enable_raw_mode() {
  * 좌우 방향키 입력을 감지하여 이중 연결 리스트를 순회하며 화면을 갱신함
  */
 void view_fails_interactive(FailNode *head) {
-    if (head == NULL) return;
+    if (head == NULL)
+        return;
 
     FailNode *curr = head; // 현재 화면에 출력될 반례 노드 포인터
     int key; // 사용자 입력 키 값
@@ -369,17 +421,25 @@ void view_fails_interactive(FailNode *head) {
 
         key = getchar();
         if (key == '\n' || key == 'q' || key == 'Q') break;
-
-        // 이스케이프 시퀀스 처리
         if (key == '\033') {
-            getchar(); 
-            switch (getchar()) {
-                case 'C': if (curr->next != NULL) curr = curr->next; break;
-                case 'D': if (curr->prev != NULL) curr = curr->prev; break;
+            int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+            fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+            
+            int ch2 = getchar();
+            int ch3 = getchar();
+            fcntl(STDIN_FILENO, F_SETFL, flags); // 원래 상태(블로킹 모드)로 복구
+            
+            // 방향키 데이터가 맞는지 정상 검증 후 무빙
+            if (ch2 == '[') {
+                switch (ch3) {
+                    case 'A': /*위 방향키*/ break;
+                    case 'B': /*아래 방향키*/ break;
+                    case 'C': if (curr->next != NULL) curr = curr->next; break; // 오른쪽
+                    case 'D': if (curr->prev != NULL) curr = curr->prev; break; // 왼쪽
+                }
             }
         }
     }
-
     disable_raw_mode(); 
     printf("\033[H\033[J");
 }
@@ -399,13 +459,16 @@ int select_language() {
         printf(MSG_PROMPT_LANG);
         
         for (int i = 0; i < num_langs; i++) {
-            if (i == selected) printf("  > \033[1;32m%s\033[0m <\n", languages[i]);
-            else printf("    %s\n", languages[i]);
+            if (i == selected)
+                printf("  > \033[1;32m%s\033[0m <\n", languages[i]);
+            else
+                printf("    %s\n", languages[i]);
         }
         printf("\n=========================================\n");
 
         key = getchar();
-        if (key == '\n') break;
+        if (key == '\n')
+            break;
         
         if (key == '\033') {
             getchar(); 
@@ -441,7 +504,8 @@ void run_judge_session(const char *prob_num, int max_test_cases, const char *gen
             fclose(tc_file);
         } else {
             int gen_pipe[2]; // 제너레이터 출력을 받을 파이프 배열
-            if (pipe(gen_pipe) < 0) die("pipe error");
+            if (pipe(gen_pipe) < 0)
+                die("pipe error");
             
             gen_pid = execute_process(gen_cmd, STDIN_FILENO, gen_pipe[1], 0);
             close(gen_pipe[1]);
@@ -454,7 +518,8 @@ void run_judge_session(const char *prob_num, int max_test_cases, const char *gen
         }
 
         int sol_in[2], sol_out[2], sub_in[2], sub_out[2];
-        if (pipe(sol_in) < 0 || pipe(sol_out) < 0 || pipe(sub_in) < 0 || pipe(sub_out) < 0) {
+        if (pipe2(sol_in, O_CLOEXEC) < 0 || pipe2(sol_out, O_CLOEXEC) < 0 || 
+            pipe2(sub_in, O_CLOEXEC) < 0 || pipe2(sub_out, O_CLOEXEC) < 0) {
             die("pipe error");
         }
 
@@ -462,12 +527,15 @@ void run_judge_session(const char *prob_num, int max_test_cases, const char *gen
         sol_pid = execute_process(sol_cmd, sol_in[0], sol_out[1], 0);
         sub_pid = execute_process(sub_cmd, sub_in[0], sub_out[1], 1); 
 
-        close(sol_in[0]); close(sol_out[1]);
-        close(sub_in[0]); close(sub_out[1]);
+        close(sol_in[0]);
+        close(sol_out[1]);
+        close(sub_in[0]);
+        close(sub_out[1]);
         
         write(sol_in[1], test_case, strlen(test_case));
         write(sub_in[1], test_case, strlen(test_case));
-        close(sol_in[1]); close(sub_in[1]);
+        close(sol_in[1]);
+        close(sub_in[1]);
 
         pthread_t wd_tid; // 자식 프로세스의 Wall-clock 강제 종료를 담당할 스레드 ID
         pthread_create(&wd_tid, NULL, watchdog_thread, (void*)&sub_pid);
@@ -477,27 +545,38 @@ void run_judge_session(const char *prob_num, int max_test_cases, const char *gen
         
         read_pipes_async(sol_out[0], sol_result, sizeof(sol_result), sub_out[0], sub_result, sizeof(sub_result));
         
-        close(sol_out[0]); close(sub_out[0]);
+        close(sol_out[0]);
+        close(sub_out[0]);
 
-        waitpid(sol_pid, NULL, 0); sol_pid = -1;
+        pthread_cancel(wd_tid);
+        pthread_join(wd_tid, NULL);
+
+        if (waitpid(sol_pid, NULL, WNOHANG) == 0) { // 타임아웃 등으로 인해 아직 안 끝났다면 강제 종료
+            kill(sol_pid, SIGKILL);
+            waitpid(sol_pid, NULL, 0);
+        }
+        sol_pid = -1;
         
         int status; // 제출 프로세스의 반환 및 시그널 종료 상태 기록 변수
         struct rusage ru; // 커널로부터 회수된 시스템 자원(메모리 등) 사용량 구조체
-        wait4(sub_pid, &status, 0, &ru); 
+        if (wait4(sub_pid, &status, WNOHANG, &ru) == 0) {
+            kill(sub_pid, SIGKILL);
+            wait4(sub_pid, &status, 0, &ru);
+        }
         sub_pid = -1;
-        
-        pthread_cancel(wd_tid);
-        pthread_join(wd_tid, NULL);
 
         int is_tle = 0, is_mle = 0, is_re = 0; // 에러 판별 플래그
         long mem_used_kb = ru.ru_maxrss; // 리눅스 환경의 최대 메모리 사용량 (KB 단위)
 
-        if (mem_used_kb > MEM_LIMIT_KB) is_mle = 1;
+        if (mem_used_kb > MEM_LIMIT_KB)
+            is_mle = 1;
 
         if (WIFSIGNALED(status)) {
             int sig = WTERMSIG(status);
-            if (sig == SIGXCPU || sig == SIGKILL) is_tle = 1;
-            else is_re = 1;
+            if (sig == SIGXCPU || sig == SIGKILL)
+                is_tle = 1;
+            else
+                is_re = 1;
         }
 
         // 결과 분류 및 반례 리스트 삽입
@@ -518,13 +597,14 @@ void run_judge_session(const char *prob_num, int max_test_cases, const char *gen
         if (fail_list_head == NULL) {
             printf(MSG_ALL_PASS, test_count);
             printf(MSG_JUDGE_END);
-            while(getchar() != 'Q' || getchar() != 'q' || getchar() != '\n');
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != 'q' && ch != 'Q');
         } else {
             export_fails_to_file(fail_list_head, prob_num); 
-            view_fails_interactive(fail_list_head);         
-            free_fail_list(&fail_list_head);               
+            view_fails_interactive(fail_list_head);                       
         }
     }
+    free_fail_list(&fail_list_head); 
 }
 
 /*
@@ -549,7 +629,8 @@ int main() {
         }
 
         printf(MSG_INPUT_PATH);
-        if (fgets(file_path, sizeof(file_path), stdin) != NULL) file_path[strcspn(file_path, "\n")] = 0;
+        if (fgets(file_path, sizeof(file_path), stdin) != NULL)
+            file_path[strcspn(file_path, "\n")] = 0;
 
         while (1) {
             char tc_input[32]; // 테스트케이스 개수 입력 임시 버퍼
@@ -559,7 +640,8 @@ int main() {
                 if (parsed >= 5 && parsed <= 3000) {
                     max_test_cases = parsed;
                     break;
-                } else printf("입력 오류: 5에서 3000 범위의 정수만 입력 가능함\n");
+                } else
+                    printf("입력 오류: 5에서 3000 범위의 정수만 입력 가능함\n");
             }
         }
 
@@ -577,23 +659,25 @@ int main() {
             printf("- 언어: C\n");
             snprintf(compile_cmd, sizeof(compile_cmd), CMD_FMT_GCC, file_path, BIN_TEMP_NAME);
             printf(MSG_COMPILE_ING);
-            if (system(compile_cmd) == 0) snprintf(sub_cmd, sizeof(sub_cmd), "./%s", BIN_TEMP_NAME);
-            else { printf(MSG_COMPILE_ERR); compile_success = 0; }
+            if (system(compile_cmd) == 0)
+                snprintf(sub_cmd, sizeof(sub_cmd), "./%s", BIN_TEMP_NAME);
+            else {
+                printf(MSG_COMPILE_ERR);
+                compile_success = 0;
+            }
         } else if (lang_choice == 1) { 
             printf("- 언어: C++\n");
             snprintf(compile_cmd, sizeof(compile_cmd), CMD_FMT_GPP, file_path, BIN_TEMP_NAME);
             printf(MSG_COMPILE_ING);
-            if (system(compile_cmd) == 0) snprintf(sub_cmd, sizeof(sub_cmd), "./%s", BIN_TEMP_NAME);
-            else { printf(MSG_COMPILE_ERR); compile_success = 0; }
-        } else if(lang_choice == 2)
-        {  // 0 || 1 아닐 경우 전부 파이썬 처리되는 것 방지
+            if (system(compile_cmd) == 0)
+                snprintf(sub_cmd, sizeof(sub_cmd), "./%s", BIN_TEMP_NAME);
+            else {
+                printf(MSG_COMPILE_ERR);
+                compile_success = 0;
+            }
+        } else { 
             printf("- 언어: Python\n");
             snprintf(sub_cmd, sizeof(sub_cmd), CMD_FMT_PYTHON, file_path);
-        }
-        else
-        {
-            printf("잘못된 번호입니다. 다시 시작해 주세요.\n");
-            continue;
         }
 
         if (compile_success) {
